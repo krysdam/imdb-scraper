@@ -1,0 +1,370 @@
+#!/usr/bin/python3
+
+import requests
+from bs4 import BeautifulSoup
+from collections import defaultdict
+import math
+import time
+import os
+import re
+
+# General
+###############################################################################
+
+# The time the program starts
+start = time.time()
+def log(s):
+    """Print that something has happened, with a timestamp."""
+    print("{}\t{}".format(int(time.time() - start), s))
+
+
+# TSV stuff
+###############################################################################
+
+def readTSV(fname, columnHeaders):
+    """
+    Read (a subset) of a TSV into a list of records
+    fname: the name of the TSV file
+    columnHeaders: the names of the columns to be read
+    returns: a list of tuples, each representing one record
+    """
+    log("reading TSV from {}".format(fname))
+
+    # The list of tuples.
+    db = []
+
+    try:
+        with open(fname, "r") as f:
+            # Are we currently looking at the header line?
+            # True at first, False after the first row.
+            isHeader = True
+
+            # Read every line of the TSV.
+            while True:
+                l = f.readline()
+                if not l: break
+
+                # The elements of the row.
+                cells = l.strip("\n").split("\t")
+
+                # Find the indices of the desired columns.
+                # After this, we aren't on the header anymore.
+                if isHeader:
+                    indices = [cells.index(header) for header in columnHeaders]
+                    isHeader = False
+
+                # Find the desired values of the record.
+                else:
+                    try:
+                        record = [cells[i] for i in indices]
+                    except:
+                        # If this fails, it's doomed.
+                        print("readTSV failed on this line:")
+                        print(cells)
+                        exit()
+                    db.append(record)
+    # If the file does not exist or has no records, return None.
+    except FileNotFoundError:
+        return None
+    if isHeader:
+        return None
+    return db
+
+def readTitleTypes():
+    """Make dict {ttid : title type (eg, "movie")}, from interface db"""
+    tsv = readTSV("title.basics.tsv", ["tconst", "titleType"])
+    #print({ttype:True for _,ttype in tsv})
+    return {ttid:ttype for ttid,ttype in tsv}
+
+def readPublishedVotes():
+    """Make dict {ttid : rating count}, from interface db"""
+    tsv = readTSV("title.ratings.tsv", ["tconst", "numVotes"])
+    return {ttid:int(ratings) for ttid,ratings in tsv}
+
+def readWorthwhileMovies():
+    """Make list of ttids representing movies with 1000 or more total votes in the interface db"""
+    titleTypes = readTitleTypes()
+    publishedVotes = readPublishedVotes()
+    return [ttid for ttid in publishedVotes if publishedVotes[ttid] >= 1000 and titleTypes[ttid] in ["movie", "tvMovie"]]
+
+def readWorthwhileShows():
+    """Make list of ttids representing shows with 1000 or more total votes in the interface db"""
+    titleTypes = readTitleTypes()
+    publishedVotes = readPublishedVotes()
+    return [ttid for ttid in publishedVotes if publishedVotes[ttid] >= 1000 and titleTypes[ttid] in ["tvSeries", "tvMiniSeries"]]
+
+def getNumberFromTag(tag):
+    """Pull integer out of html tag containing a number.
+    Ex: <a href=whatever>\n1,234\n</a>
+            --> 1234"""
+    content = tag.contents[0]
+    num = int( content.strip().replace(",", "") )
+    return num
+
+def buildTSV(fname, header, items, process):
+    """Build (or continue building) a TSV file.
+    fname: name of the output file
+    items: objects to iterate over
+    process: function from item --> list of tuples
+
+    Produces a TSV of all tuples produced from all items."""
+
+    # Track progress in a separate file.
+    # One column, called "completed", lists completed items
+    progressFname = "{}.progress".format(fname)
+
+    # Figure out which items have been processed
+    progressTSV = readTSV(progressFname, ["completed"])
+    if progressTSV == None:
+        alreadyFinished = {}
+    else:
+        alreadyFinished = {rep:True for (rep,) in progressTSV}
+
+    # The TSV so far
+    tsvSoFar = readTSV(fname, header)
+
+    # Open the TSV and the progress file
+    with open(fname, "a") as tsv, open(progressFname, "a") as prog:
+        # If files didn't exist (or had no headers), write headers
+        if progressTSV == None:
+            prog.write("completed\n")
+        if tsvSoFar == None:
+            tsv.write("\t".join(header) + "\n")
+
+        # Stats
+        done = len(alreadyFinished)
+        doneThisSession = 0
+        sessionStart = time.time()
+
+        # Iteration
+        for i in items:
+            # Check if this item is done
+            rep = str(i)
+            if rep in alreadyFinished: continue
+
+            # Determine the rows that need to be added.
+            rowsToAdd = process(i)
+
+            # Write the rows as text.
+            toWrite = "\n".join(["\t".join(map(str, row)) for row in rowsToAdd])
+            tsv.write(toWrite + "\n")
+
+            # Write to the progress file.
+            prog.write(rep + "\n")
+
+            # Flush both.
+            tsv.flush()
+            prog.flush()
+
+            # Stats
+            done += 1
+            doneThisSession += 1
+
+            # If at a round-number milestone, print progress.
+            if doneThisSession == 1 or doneThisSession == 10 or doneThisSession%100==0:
+                elapsed = time.time() - sessionStart
+                timePerItem = elapsed / doneThisSession
+                remaining = timePerItem * (len(items) - done)
+                log("\t".join(["done {} items ({:.02%})".format(done, done / len(items)),
+                               "{:.03}s/item".format(timePerItem),
+                               "remaining: {:.03}h or {}m or {}s".format(remaining/3600, int(remaining/60), int(remaining))]))
+
+# HTML
+###############################################################################
+
+# match ids: ttids, nmids, and other s (if any)
+matchId = re.compile("[a-z][a-z]\d+")
+def stripIdFromURL(url):
+    """Return the first id that appears in the given url.
+    Given: that there is an id in the url. Exit otherwise."""
+    for part in url.split("/"):
+        if matchId.match(part):
+            return part
+    exit("No ID in URL: {}".format(url))
+
+def pullSiteVoteInfo(ttid):
+    """Strip male and female votes from the site, given a ttid.
+    return: (male rating count, female rating count)"""
+
+    # The url of the ttid's ratings
+    url = "https://imdb.com/title/{}/ratings".format(ttid)
+
+    # Use a timeout, and retry on any kind of exception
+    while True:
+        try:
+            # Pull the site and parse it
+            r = requests.get(url, timeout = 30)
+            bs = BeautifulSoup(r.text, features="lxml")
+
+            # Scrape male and female rating counts
+            maleVotes = None
+            femaleVotes = None
+
+            for tag in bs.find_all("a", href="/title/{}/ratings?demo=males".format(ttid)):
+                maleVotes = getNumberFromTag(tag)
+
+            for tag in bs.find_all("a", href="/title/{}/ratings?demo=females".format(ttid)):
+                femaleVotes = getNumberFromTag(tag)
+
+            # Return the pair
+            return (maleVotes, femaleVotes)
+
+        #except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout):
+        except Exception as e:
+            print("failed... ({})".format(e))
+            time.sleep(10)
+            pass
+
+# Ratings
+###############################################################################
+
+def buildGenderRatings():
+    """Create TSVs of movies and shows with their male and female votes"""
+
+    def processTtid(ttid):
+        """For a given ttid, build TSV record from scraped votes"""
+        maleVotes, femaleVotes = pullSiteVoteInfo(ttid)
+        if maleVotes == None or femaleVotes == None:
+            print("WARNING: could not find male/female vote counts for {}".format(ttid))
+            lines = []
+        else:
+            lines = [(ttid, maleVotes, femaleVotes)]
+        return lines
+
+    # Movies TSV
+    movies = readWorthwhileMovies()
+    buildTSV("movie-gender-votes.tsv", ["ttid", "maleVotes", "femaleVotes"], movies, processTtid)
+
+    # Shows TSV
+    shows = readWorthwhileShows()
+    buildTSV("show-gender-votes.tsv", ["ttid", "maleVotes", "femaleVotes"], shows, processTtid)
+
+def buildVotes():
+    """Create TSVs of movies and shows with their WEIGHTED sum of male and female votes"""
+
+    # Repeat a similar process for movies, and then for shows
+    for thing in ["movie", "show"]:
+        print("looking at {}s".format(thing))
+        genderVotes_tsv = thing + "-gender-votes.tsv"
+        votes_tsv = thing + "-votes.tsv"
+    
+        # Make dict from ttid to maleVotes and femaleVotes
+        genderVotesTSV = readTSV(genderVotes_tsv, ["ttid", "maleVotes", "femaleVotes"])
+        genderVotes = {ttid:(int(maleVotes), int(femaleVotes)) for (ttid, maleVotes, femaleVotes) in genderVotesTSV}
+
+        # Determine total male and female ratings
+        totalMaleVotes = 0
+        totalFemaleVotes = 0
+        for i in genderVotes:
+            try:
+                totalMaleVotes += genderVotes[i][0]
+                totalFemaleVotes += genderVotes[i][1]
+            except KeyError:
+                print("{} not found".format(i))
+
+        # Determine gender bias
+        maleBias = totalMaleVotes / totalFemaleVotes
+        print("male bias: {}".format(maleBias))
+
+        votes = {}
+        for i in genderVotes:
+            try:
+                votes[i] = genderVotes[i][0] + maleBias * genderVotes[i][1]
+            except KeyError:
+                pass
+
+        with open(votes_tsv, "w") as f:
+            f.write("ttid\tvotes\n")
+            for i in votes:
+                f.write("{}\t{}\n".format(i, votes[i]))
+
+
+#buildGenderRatings()
+#buildVotes()
+
+
+basicsTSV = readTSV("title.basics.tsv", ["tconst", "primaryTitle", "startYear", "genres"])
+names = {ttid:name for (ttid, name, _, _) in basicsTSV}
+genres = {ttid:genre for (ttid, _, _, genre) in basicsTSV}
+years = {}
+for (ttid, _, year, _) in basicsTSV:
+    try:
+        years[ttid] = int(year)
+    except ValueError:
+        pass
+
+movieVotesTSV = readTSV("movie-votes.tsv", ["ttid", "votes"])
+showVotesTSV = readTSV("show-votes.tsv", ["ttid", "votes"])
+movieVotes = {ttid:float(votes) for (ttid, votes) in movieVotesTSV}
+showVotes = {ttid:float(votes) for (ttid, votes) in showVotesTSV}
+
+# Temporal bias
+# Recent titles are likely to have more votes than old titles,
+#   since online IMDb users are more likely to rate those.
+# And, VERY-recent titles are likely to have fewer votes than they deserve,
+#   since people haven't had time to actually rate them yet.
+# How should I account for this temporal bias?
+
+# Idea 1: compare vote-counts to the average for their respective decade
+#   find the "average vote count" for each decade
+#   then divide all vote counts by the respective decade averages
+#   rank titles by this "normalized" vote count
+#   But! Then titles later in the decade get an unfair boost!
+
+# Idea 2: normalize against a smaller window than decades
+#   same as idea 1, but only use previous, current, and next year
+#   instead of the whole decade
+#   but what are these averages?
+#       I already filtered for only titles   with >1000 raw votes
+#       the average vote count in those filtered list, is meaningless!
+#       In order to find the titles with the most-votes-compared-to-their-time,
+#       I would need to actually examine all the titles from each time,
+#       which would mean scraping the site for months.
+
+# Idea 3: don't correct for the temporal bias
+#   I want to watch the "most-rated" titles. Why?
+#   Well, I want to watch good movies and shows, and those are likely to have many votes.
+#   But more importantly, I want to watch titles that are in the zeitgeist today.
+#   That means allowing this particular bias into the egg-basket, or bath-water, if you will.
+#   (The same reasoning does not apply to gender bias,
+#   since the zeitgeist is half in the minds of women,
+#   but not half in the past.)
+
+# So, just take the top large_constant movies, sorted by votes.
+
+moviesSorted = sorted(movieVotes.keys(), key = (lambda i: movieVotes[i]), reverse=True)
+showsSorted = sorted(showVotes.keys(), key = (lambda i: showVotes[i]), reverse=True)
+
+moviesSorted = filter((lambda m: "Musical" in genres[m]), moviesSorted)
+showsSorted = filter((lambda s: "Musical" in genres[s]), showsSorted)
+
+items = []
+rank = 1
+for m in moviesSorted:
+    try:
+        items.append((rank, "movie", years[m], names[m], movieVotes[m], genres[m]))
+    except KeyError:
+        print("missing movie: {}".format(m))
+        pass
+    rank += 1
+
+rank = 1
+for s in showsSorted:
+    try:
+        items.append((rank, "show", years[s], names[s], showVotes[s], genres[m]))
+    except KeyError:
+        print("missing show: {}".format(s))
+        pass
+    rank += 1
+
+
+# sort by year, then movie/show, then by votes
+items = sorted(items, key = (lambda i: (i[2], i[1], i[4])))
+
+lastYear = None
+for i in items:
+    year = i[2]
+    if year != lastYear: print()
+    lastYear = year
+    # top/not    movie/show    year    genres    title
+    print("{}\t{}\t{}\t{}\t{}".format(i[0], i[1], i[2], i[5], i[3]))
